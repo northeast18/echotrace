@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import '../models/message.dart';
 import '../services/image_service.dart';
@@ -10,6 +11,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../services/logger_service.dart';
 
+enum _ImageVariant { big, original, high, cache, thumb, other }
 
 /// 图片消息组件 - 显示聊天中的图片
 class ImageMessageWidget extends StatefulWidget {
@@ -38,6 +40,17 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
   String? _displayName;
 
   static final Map<String, String> _decryptedIndex = {};
+  static final Map<String, Map<_ImageVariant, String>> _decryptedVariantIndex =
+      {};
+  static final Set<String> _invalidImagePaths = {};
+  static const List<_ImageVariant> _variantPriority = [
+    _ImageVariant.big,
+    _ImageVariant.original,
+    _ImageVariant.high,
+    _ImageVariant.cache,
+    _ImageVariant.thumb,
+    _ImageVariant.other,
+  ];
   static bool _indexed = false;
 
   @override
@@ -59,6 +72,8 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
       // 每次加载都刷新索引，避免缓存不到新解密的图片（含 cache）
       _indexed = false;
       _decryptedIndex.clear();
+      _decryptedVariantIndex.clear();
+      _invalidImagePaths.clear();
 
       // 初始化图片服务
       final dataPath = appState.databaseService.currentDataPath;
@@ -329,7 +344,7 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
   Future<String?> _findDecryptedImageByName(String? baseName,
       {bool refresh = false}) async {
     if (baseName == null || baseName.isEmpty) return null;
-    final key = baseName.toLowerCase();
+    final key = _normalizeBaseName(baseName);
     if (!refresh && _decryptedIndex.containsKey(key)) {
       return _decryptedIndex[key];
     }
@@ -337,11 +352,24 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
     if (!_indexed) {
       await _buildDecryptedIndex();
     }
-    return _decryptedIndex[key];
+    final variants = _decryptedVariantIndex[key];
+    if (variants == null || variants.isEmpty) return null;
+
+    for (final path in _orderedVariantPaths(variants)) {
+      if (_invalidImagePaths.contains(path)) continue;
+      if (await _isImageUsable(path)) {
+        _decryptedIndex[key] = path;
+        return path;
+      }
+      _invalidImagePaths.add(path);
+    }
+    return null;
   }
 
   Future<void> _buildDecryptedIndex() async {
     _indexed = true;
+    _decryptedVariantIndex.clear();
+    _invalidImagePaths.clear();
     try {
       final docs = await getApplicationDocumentsDirectory();
       final imagesRoot =
@@ -351,20 +379,78 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
       await for (final entity
           in imagesRoot.list(recursive: true, followLinks: false)) {
         if (entity is! File) continue;
-        final name = p.basename(entity.path).toLowerCase();
-        final base = name.split('.').first;
-        _decryptedIndex[base] = entity.path;
-        // 兼容缩略图/缓存文件名结尾的 _b/_c，映射去掉后缀以便匹配
-        for (final suffix in ['_b', '_c']) {
-          if (base.endsWith(suffix)) {
-            final trimmed = base.substring(0, base.length - suffix.length);
-            _decryptedIndex[trimmed] = entity.path;
-          }
-        }
+        final base = p.basenameWithoutExtension(entity.path).toLowerCase();
+        final normalized = _normalizeBaseName(base);
+        final variant = _detectVariant(base);
+        _indexDecryptedVariant(normalized, variant, entity.path);
       }
     } catch (_) {
       // 忽略索引失败
     }
+  }
+
+  void _indexDecryptedVariant(
+    String key,
+    _ImageVariant variant,
+    String path,
+  ) {
+    final variants = _decryptedVariantIndex.putIfAbsent(key, () => {});
+    variants[variant] ??= path;
+  }
+
+  List<String> _orderedVariantPaths(Map<_ImageVariant, String> variants) {
+    final ordered = <String>[];
+    for (final variant in _variantPriority) {
+      final path = variants[variant];
+      if (path != null) ordered.add(path);
+    }
+    return ordered;
+  }
+
+  String _normalizeBaseName(String name) {
+    var base = name.toLowerCase();
+    if (base.endsWith('.dat') || base.endsWith('.jpg')) {
+      base = base.substring(0, base.length - 4);
+    }
+    for (final suffix in ['_b', '_h', '_t', '_c']) {
+      if (base.endsWith(suffix)) {
+        base = base.substring(0, base.length - suffix.length);
+        break;
+      }
+    }
+    return base;
+  }
+
+  _ImageVariant _detectVariant(String base) {
+    if (base.endsWith('_b')) return _ImageVariant.big;
+    if (base.endsWith('_t')) return _ImageVariant.thumb;
+    if (base.endsWith('_h')) return _ImageVariant.high;
+    if (base.endsWith('_c')) return _ImageVariant.cache;
+    return _ImageVariant.original;
+  }
+
+  Future<bool> _isImageUsable(String path) async {
+    try {
+      final file = File(path);
+      if (!await file.exists()) return false;
+      final bytes = await file.readAsBytes();
+      if (bytes.isEmpty) return false;
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      frame.image.dispose();
+      codec.dispose();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void _rememberDecryptedFile(String path) {
+    final base = p.basenameWithoutExtension(path).toLowerCase();
+    final normalized = _normalizeBaseName(base);
+    final variant = _detectVariant(base);
+    _indexDecryptedVariant(normalized, variant, path);
+    _decryptedIndex[normalized] = path;
   }
 
   Future<void> _decryptOnDemand() async {
@@ -401,11 +487,11 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
         return;
       }
 
-      final datPath =
-          await _searchDatFile(accountDir, _datName!.toLowerCase());
-      if (datPath == null) {
+      final datCandidates =
+          await _searchDatFiles(accountDir, _datName!.toLowerCase());
+      if (datCandidates.isEmpty) {
         setState(() {
-          _statusMessage = '未找到对应的图片文件（*.dat），请先在数据管理中扫描/解密';
+          _statusMessage = '未找到对应的图片文件（*.dat），源文件没有被下载或已被删除';
         });
         return;
       }
@@ -435,43 +521,77 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
         await imagesRoot.create(recursive: true);
       }
 
-      // 输出路径保持与原始相对路径一致，便于与“数据管理”页面统一
-      String relative =
-          p.relative(datPath, from: accountDir.path).replaceAll('\\', p.separator);
-      if (relative.startsWith('..')) {
-        // 防御：相对路径异常时退化为根级文件
-        relative = '${_datName!}.jpg';
-      } else {
-        if (relative.toLowerCase().endsWith('.t.dat')) {
-          relative = relative.substring(0, relative.length - 6) + '.jpg';
-        } else if (relative.toLowerCase().endsWith('.dat')) {
-          relative = relative.substring(0, relative.length - 4) + '.jpg';
-        } else if (!relative.toLowerCase().endsWith('.jpg')) {
-          relative = '$relative.jpg';
+      String? validOutput;
+      bool usedFallback = false;
+      for (final datPath in datCandidates) {
+        // 输出路径保持与原始相对路径一致，便于与“数据管理”页面统一
+        String relative = p
+            .relative(datPath, from: accountDir.path)
+            .replaceAll('\\', p.separator);
+        if (relative.startsWith('..')) {
+          // 防御：相对路径异常时退化为根级文件
+          relative = '${_datName!}.jpg';
+        } else {
+          final lowerRel = relative.toLowerCase();
+          if (lowerRel.endsWith('.t.dat')) {
+            relative = '${relative.substring(0, relative.length - 6)}.jpg';
+          } else if (lowerRel.endsWith('.dat')) {
+            relative = '${relative.substring(0, relative.length - 4)}.jpg';
+          } else if (!lowerRel.endsWith('.jpg')) {
+            relative = '$relative.jpg';
+          }
+          relative = _applyDisplayNameToRelative(relative);
         }
-        relative = _applyDisplayNameToRelative(relative);
+
+        final outPath = p.join(imagesRoot.path, relative);
+        final outParent = Directory(p.dirname(outPath));
+        if (!await outParent.exists()) {
+          await outParent.create(recursive: true);
+        }
+
+        try {
+          await decryptService.decryptDatAutoAsync(
+            datPath,
+            outPath,
+            xorKey,
+            aesKey,
+          );
+        } catch (e, stack) {
+          await logger.error(
+            'ChatImage',
+            '解密图片失败，尝试下一候选: $datPath',
+            e,
+            stack,
+          );
+          usedFallback = true;
+          continue;
+        }
+
+        if (await _isImageUsable(outPath)) {
+          validOutput = outPath;
+          usedFallback = usedFallback || datPath != datCandidates.first;
+          _rememberDecryptedFile(outPath);
+          break;
+        } else {
+          _invalidImagePaths.add(outPath);
+          usedFallback = true;
+        }
       }
 
-      final outPath = p.join(imagesRoot.path, relative);
-      final outParent = Directory(p.dirname(outPath));
-      if (!await outParent.exists()) {
-        await outParent.create(recursive: true);
+      if (validOutput == null) {
+        setState(() {
+          _statusMessage = '解密失败，图片可能已损坏';
+          _hasError = true;
+        });
+        return;
       }
-
-      await decryptService.decryptDatAutoAsync(
-        datPath,
-        outPath,
-        xorKey,
-        aesKey,
-      );
-
-      _decryptedIndex[_datName!.toLowerCase()] = outPath;
 
       if (mounted) {
         setState(() {
-          _imagePath = outPath;
+          _imagePath = validOutput;
           _hasError = false;
-          _statusMessage = null;
+          _statusMessage =
+              usedFallback ? '已降级展示可用版本的图片' : null;
         });
       }
     } catch (e) {
@@ -489,35 +609,26 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
     }
   }
 
-  Future<String?> _searchDatFile(
+  Future<List<String>> _searchDatFiles(
     Directory accountDir,
     String targetBase,
   ) async {
-    String? result;
-    // 优先原图，再回退多种缩略图后缀 (_b/_h/_t 等)
-    final candidates = <String>[
-      '$targetBase.dat',
-      '${targetBase}_b.dat',
-      '${targetBase}_h.dat',
-      '${targetBase}_t.dat',
-    ];
+    final normalized = _normalizeBaseName(targetBase);
+    final found = <_ImageVariant, String>{};
     try {
       await for (final entity
           in accountDir.list(recursive: true, followLinks: false)) {
         if (entity is! File) continue;
         final name = p.basename(entity.path).toLowerCase();
         if (!name.endsWith('.dat')) continue;
-        if (candidates.contains(name)) {
-          result = entity.path;
-          // 若找到原图可直接返回；否则继续寻找原图
-          if (name.endsWith('.dat') &&
-              !name.endsWith('_b.dat') &&
-              !name.endsWith('_h.dat') &&
-              !name.endsWith('_t.dat')) return result;
-        }
+        final base = name.substring(0, name.length - 4);
+        final normalizedBase = _normalizeBaseName(base);
+        if (normalizedBase != normalized) continue;
+        final variant = _detectVariant(base);
+        found[variant] ??= entity.path;
       }
     } catch (_) {}
-    return result;
+    return _orderedVariantPaths(found);
   }
 
   void _logDebugPaths(String? resolved) {
@@ -526,10 +637,13 @@ class _ImageMessageWidgetState extends State<ImageMessageWidget> {
         'ChatImage',
         '查找解密图片: datName=$_datName, displayName=$_displayName, 解析到=$resolved',
       );
-      if (_decryptedIndex.isNotEmpty) {
-        final sample = _decryptedIndex.entries
+      if (_decryptedVariantIndex.isNotEmpty) {
+        final sample = _decryptedVariantIndex.entries
             .take(5)
-            .map((e) => '${e.key}:${e.value}')
+            .map((e) {
+              final variants = e.value.keys.map((v) => v.name).join('/');
+              return '${e.key}:$variants';
+            })
             .join(', ');
         logger.debug('ChatImage', '当前已索引解密文件(部分): $sample');
       }

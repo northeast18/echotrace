@@ -54,6 +54,10 @@ class DatabaseService {
 
   // 缓存的消息数据库连接
   final Map<String, Database> _cachedMessageDbs = {};
+  // 批量工具：缓存会话消息表来源，避免重复遍历所有 message_*.db
+  final Map<String, List<MessageQuerySource>> _bulkQuerySourceCache = {};
+  DateTime? _bulkQuerySourceCacheTime;
+  static const Duration _bulkQuerySourceCacheDuration = Duration(minutes: 5);
   DateTime? _cacheLastUsed;
   static const Duration _cacheDuration = Duration(minutes: 5);
   // 缓存扫描到的消息数据库路径，避免重复的磁盘遍历
@@ -1015,6 +1019,97 @@ class DatabaseService {
     }
   }
 
+  /// 为批量解密/导出准备会话消息表来源（复用已缓存打开的 message_*.db，避免重复打开/遍历）。
+  Future<List<MessageQuerySource>> prepareBulkMessageQuerySources(
+    String sessionId,
+  ) async {
+    if (_sessionDb == null) {
+      throw Exception('数据库未连接');
+    }
+
+    if (_bulkQuerySourceCacheTime != null &&
+        DateTime.now().difference(_bulkQuerySourceCacheTime!) <
+            _bulkQuerySourceCacheDuration &&
+        _bulkQuerySourceCache.containsKey(sessionId)) {
+      return _bulkQuerySourceCache[sessionId]!;
+    }
+
+    final infos = await _collectTableInfosAcrossDatabases(sessionId);
+    final sources = <MessageQuerySource>[];
+    for (final info in infos) {
+      String? typeColumn;
+      bool hasPackedInfoData = false;
+      try {
+        final pragmaRows =
+            await info.database.rawQuery("PRAGMA table_info('${info.tableName}')");
+        final cols = pragmaRows
+            .map((row) => (row['name'] as String?)?.toLowerCase() ?? '')
+            .toSet();
+        if (cols.contains('local_type')) {
+          typeColumn = 'local_type';
+        } else if (cols.contains('type')) {
+          typeColumn = 'type';
+        }
+        hasPackedInfoData = cols.contains('packed_info_data');
+      } catch (_) {
+        // ignore
+      }
+      sources.add(
+        MessageQuerySource(
+          database: info.database,
+          tableName: info.tableName,
+          hasSortSeq: info.schema.hasSortSeq,
+          hasCreateTime: info.schema.hasCreateTime,
+          typeColumn: typeColumn,
+          hasPackedInfoData: hasPackedInfoData,
+        ),
+      );
+    }
+    _bulkQuerySourceCache[sessionId] = sources;
+    _bulkQuerySourceCacheTime = DateTime.now();
+    return sources;
+  }
+
+  /// 批量扫描专用：从已准备好的 sources 中按时间范围查询，并只构建轻量 Message（避免解压/解析）。
+  Future<List<Message>> queryMessagesLiteFromSources(
+    List<MessageQuerySource> sources,
+    int begintimestamp,
+    int endtimestamp, {
+    required Set<int> localTypes,
+    required bool includePackedInfoData,
+  }) async {
+    if (_sessionDb == null) {
+      throw Exception('数据库未连接');
+    }
+    if (sources.isEmpty) return [];
+
+    final results = <Message>[];
+    for (final src in sources) {
+      try {
+        final schema = _MessageTableSchema(
+          hasSortSeq: src.hasSortSeq,
+          hasCreateTime: src.hasCreateTime,
+        );
+        final hasPacked = includePackedInfoData && src.hasPackedInfoData;
+        final chunk = await _queryMessagesFromTableLite(
+          src.database,
+          src.tableName,
+          schema,
+          typeColumn: src.typeColumn,
+          hasPackedInfoData: hasPacked,
+          begintimestamp: begintimestamp,
+          endTimestamp: endtimestamp,
+          localTypes: localTypes,
+        );
+        if (chunk.isNotEmpty) results.addAll(chunk);
+      } catch (_) {
+        // 单表失败不影响整体
+      }
+    }
+    results.sort((a, b) => b.createTime.compareTo(a.createTime));
+    return results;
+  }
+
   /// 从指定表查询消息
   Future<List<Message>> _queryMessagesFromTable(
     Database db,
@@ -1116,6 +1211,68 @@ class DatabaseService {
     return maps
         .map((map) => Message.fromMap(map, myWxid: _currentAccountWxid))
         .toList();
+  }
+
+  Future<List<Message>> _queryMessagesFromTableLite(
+    Database db,
+    String tableName,
+    _MessageTableSchema schema, {
+    required String? typeColumn,
+    required bool hasPackedInfoData,
+    int begintimestamp = 0,
+    int endTimestamp = 0,
+    required Set<int> localTypes,
+  }) async {
+    final buffer = StringBuffer('SELECT ');
+    buffer.write('m.local_id, m.create_time, ');
+    if (typeColumn != null) {
+      buffer.write('m.$typeColumn AS local_type, ');
+    } else {
+      buffer.write('m.local_type AS local_type, ');
+    }
+    buffer.write('m.real_sender_id, ');
+    if (hasPackedInfoData) {
+      buffer.write('m.packed_info_data, ');
+    }
+    buffer.write(
+      'CASE WHEN m.real_sender_id = (SELECT rowid FROM Name2Id WHERE user_name = ?) '
+      'THEN 1 ELSE 0 END AS computed_is_send, ',
+    );
+    buffer.write('n.user_name AS sender_username ');
+    buffer.write(
+      'FROM $tableName m LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid',
+    );
+
+    final whereClauses = <String>[];
+    final args = <Object?>[_currentAccountWxid ?? ''];
+    if (begintimestamp > 0) {
+      whereClauses.add('m.create_time >= ?');
+      args.add(begintimestamp);
+    }
+    if (endTimestamp > 0) {
+      whereClauses.add('m.create_time <= ?');
+      args.add(endTimestamp);
+    }
+    if (typeColumn != null && localTypes.isNotEmpty) {
+      whereClauses.add(
+        'm.$typeColumn IN (${List.filled(localTypes.length, '?').join(',')})',
+      );
+      args.addAll(localTypes);
+    }
+    if (whereClauses.isNotEmpty) {
+      buffer.write(' WHERE ${whereClauses.join(' AND ')}');
+    }
+    buffer.write(' ORDER BY ${schema.orderClauses(alias: 'm').join(', ')}');
+
+    final maps = await db.rawQuery(buffer.toString(), args);
+    if (maps.isEmpty) return const [];
+
+    final messages =
+        maps.map((m) => Message.fromMapLite(m, myWxid: _currentAccountWxid)).toList();
+    if (typeColumn == null && localTypes.isNotEmpty) {
+      return messages.where((m) => localTypes.contains(m.localType)).toList();
+    }
+    return messages;
   }
 
   /// 获取会话的消息总数
@@ -3898,6 +4055,8 @@ class DatabaseService {
     _cacheLastUsed = null;
     _cachedMessageDbPaths = null;
     _messageDbCacheTime = null;
+    _bulkQuerySourceCache.clear();
+    _bulkQuerySourceCacheTime = null;
 
     for (final db in _cachedMediaDbs.values) {
       try {
@@ -5313,6 +5472,25 @@ class _MessageTableSchema {
     clauses.add('${prefix}local_id DESC');
     return clauses;
   }
+}
+
+/// 批量工具用：消息表查询来源（避免每个时间块都重新扫描 message_*.db）。
+class MessageQuerySource {
+  final Database database;
+  final String tableName;
+  final bool hasSortSeq;
+  final bool hasCreateTime;
+  final String? typeColumn;
+  final bool hasPackedInfoData;
+
+  const MessageQuerySource({
+    required this.database,
+    required this.tableName,
+    required this.hasSortSeq,
+    required this.hasCreateTime,
+    required this.typeColumn,
+    required this.hasPackedInfoData,
+  });
 }
 
 /// 数据库表信息（用于消息查询优先级排序）

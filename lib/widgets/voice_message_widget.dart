@@ -7,6 +7,8 @@ import 'package:provider/provider.dart';
 import '../models/message.dart';
 import '../providers/app_state.dart';
 import '../services/logger_service.dart';
+import '../services/voice_message_service.dart';
+import 'toast_overlay.dart';
 
 class VoiceMessageWidget extends StatefulWidget {
   const VoiceMessageWidget({
@@ -24,7 +26,9 @@ class VoiceMessageWidget extends StatefulWidget {
   State<VoiceMessageWidget> createState() => _VoiceMessageWidgetState();
 }
 
-class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
+class _VoiceMessageWidgetState extends State<VoiceMessageWidget>
+    with TickerProviderStateMixin {
+  late final ToastOverlay _toast;
   final AudioPlayer _player = AudioPlayer();
   bool _isDecrypting = false;
   bool _isPlaying = false;
@@ -34,11 +38,12 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
   StreamSubscription<String>? _decodeFinishedSub;
   String? _expectedOutputPath;
   static const Duration _sourceTimeout = Duration(seconds: 5);
-  static const Duration _decodeTimeout = Duration(seconds: 12);
+  static const Duration _decodeTimeout = Duration(seconds: 30);
 
   @override
   void initState() {
     super.initState();
+    _toast = ToastOverlay(this);
     _subscribeDecodeFinished();
     _initExisting();
     _stateSub = _player.onPlayerStateChanged.listen((state) {
@@ -66,24 +71,26 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
   Future<void> _subscribeDecodeFinished() async {
     _decodeFinishedSub?.cancel();
     final appState = context.read<AppState>();
-    final outputFile =
-        await appState.voiceService.getOutputFile(widget.message, widget.sessionUsername);
+    final outputFile = await appState.voiceService.getOutputFile(
+      widget.message,
+      widget.sessionUsername,
+    );
     if (!mounted) return;
     _expectedOutputPath = outputFile.path;
-    _decodeFinishedSub = appState.voiceService.decodeFinishedStream.listen(
-      (path) async {
-        if (!mounted) return;
-        if (path != _expectedOutputPath) return;
-        final exists = await File(path).exists();
-        if (!mounted || !exists) return;
-        setState(() {
-          _filePath = path;
-          _isDecrypting = false;
-          _isPaused = false;
-          _isPlaying = false;
-        });
-      },
-    );
+    _decodeFinishedSub = appState.voiceService.decodeFinishedStream.listen((
+      path,
+    ) async {
+      if (!mounted) return;
+      if (path != _expectedOutputPath) return;
+      final exists = await File(path).exists();
+      if (!mounted || !exists) return;
+      setState(() {
+        _filePath = path;
+        _isDecrypting = false;
+        _isPaused = false;
+        _isPlaying = false;
+      });
+    });
   }
 
   Future<void> _initExisting() async {
@@ -122,10 +129,7 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
     try {
       final appState = context.read<AppState>();
       final file = await appState.voiceService
-          .ensureVoiceDecoded(
-            widget.message,
-            widget.sessionUsername,
-          )
+          .ensureVoiceDecoded(widget.message, widget.sessionUsername)
           .timeout(
             _decodeTimeout,
             onTimeout: () => throw TimeoutException('语音解密超时'),
@@ -141,6 +145,9 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
         _isPlaying = false;
       });
       // 不自动加载/播放，等待用户点击，避免卡住
+    } on SelfSentVoiceNotSupportedException {
+      if (!mounted) return;
+      _toast.show(context, '暂不支持解密自己发送的语音', success: false);
     } catch (e) {
       if (!mounted) return;
       // 如果后台解密已完成但状态未更新，尝试直接读取缓存文件以防UI卡住
@@ -153,7 +160,7 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
           await logger.warning(
             'VoiceWidget',
             'decode finished in background, recovered from cache: '
-            '${cached.path}, msgId=${widget.message.localId}',
+                '${cached.path}, msgId=${widget.message.localId}',
           );
           if (!mounted) return;
           setState(() {
@@ -164,14 +171,10 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
         }
       }
       if (_filePath != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('解密完成，但UI未及时更新，已恢复语音文件')),
-        );
+        _toast.show(context, '解密完成，但UI未及时更新，已恢复语音文件');
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('解密语音失败: $e')),
-      );
+      _toast.show(context, '解密语音失败: $e', success: false);
     } finally {
       if (mounted) {
         setState(() => _isDecrypting = false);
@@ -181,6 +184,7 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
 
   @override
   void dispose() {
+    _toast.dispose();
     _stateSub?.cancel();
     _decodeFinishedSub?.cancel();
     _player.dispose();
@@ -196,25 +200,23 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
     final bubbleColor = widget.isFromMe
         ? theme.colorScheme.primary
         : theme.colorScheme.surfaceContainerHighest;
-    final textColor =
-        widget.isFromMe ? Colors.white : theme.colorScheme.onSurface;
+    final textColor = widget.isFromMe
+        ? Colors.white
+        : theme.colorScheme.onSurface;
 
     final canPlay = _filePath != null;
     final isBusy = _isDecrypting;
     final icon = canPlay
         ? (_isPlaying
-            ? Icons.pause_circle_filled_rounded
-            : Icons.play_circle_fill_rounded)
+              ? Icons.pause_circle_filled_rounded
+              : Icons.play_circle_fill_rounded)
         : Icons.lock_open_rounded;
 
-    String _baseLabel() =>
-        durationText.isNotEmpty ? '语音 $durationText' : '语音';
+    String _baseLabel() => durationText.isNotEmpty ? '语音 $durationText' : '语音';
 
     String _labelForPlayable() {
       if (_isPlaying) {
-        return durationText.isNotEmpty
-            ? '播放中 $durationText'
-            : '播放中';
+        return durationText.isNotEmpty ? '播放中 $durationText' : '播放中';
       }
       return _baseLabel();
     }
@@ -224,8 +226,8 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
     final label = isBusy
         ? '解密中 ${durationText.isNotEmpty ? durationText : ""}'.trim()
         : canPlay
-            ? _labelForPlayable()
-            : _labelForLocked();
+        ? _labelForPlayable()
+        : _labelForLocked();
 
     final labelStyle = theme.textTheme.bodyMedium?.copyWith(
       color: textColor,
@@ -256,18 +258,18 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
             'VoiceWidget',
             'tap resume msgId=${widget.message.localId}',
           );
-      await _player.resume();
-      return;
-    }
-    await logger.debug(
-      'VoiceWidget',
-      'tap play msgId=${widget.message.localId} path=$_filePath',
-    );
-    if (!mounted) return;
-    await _play();
-    // 播放动作结束后强制刷新以更新按钮文本
-    if (mounted) setState(() {});
-  },
+          await _player.resume();
+          return;
+        }
+        await logger.debug(
+          'VoiceWidget',
+          'tap play msgId=${widget.message.localId} path=$_filePath',
+        );
+        if (!mounted) return;
+        await _play();
+        // 播放动作结束后强制刷新以更新按钮文本
+        if (mounted) setState(() {});
+      },
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
@@ -290,16 +292,9 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
                 ),
               )
             else
-              Icon(
-                icon,
-                size: 22,
-                color: textColor.withValues(alpha: 0.9),
-              ),
+              Icon(icon, size: 22, color: textColor.withValues(alpha: 0.9)),
             const SizedBox(width: 10),
-            Text(
-              label,
-              style: labelStyle,
-            ),
+            Text(label, style: labelStyle),
           ],
         ),
       ),
@@ -311,9 +306,9 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
     final exists = await File(path).exists();
     if (!exists) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('语音文件不存在或已被删除')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('语音文件不存在或已被删除')));
       }
       return false;
     }
@@ -322,9 +317,9 @@ class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
       return true;
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载语音失败: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('加载语音失败: $e')));
       }
       return false;
     }

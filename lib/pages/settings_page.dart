@@ -1205,7 +1205,7 @@ class _SettingsPageState extends State<SettingsPage>
                 controller: _imageXorKeyController,
                 obscureText: _obscureImageXorKey,
                 decoration: InputDecoration(
-                  hintText: '例如: 0x53 或 A3',
+                  hintText: '例如: 0x12 或 A3',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                     borderSide: BorderSide(
@@ -1257,7 +1257,7 @@ class _SettingsPageState extends State<SettingsPage>
                 controller: _imageAesKeyController,
                 obscureText: _obscureImageAesKey,
                 decoration: InputDecoration(
-                  hintText: '例如: b18052363165af7e...',
+                  hintText: '例如: b123456789012345...',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                     borderSide: BorderSide(

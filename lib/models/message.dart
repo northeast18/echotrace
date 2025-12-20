@@ -276,6 +276,84 @@ class Message {
     );
   }
 
+  /// 轻量创建（用于批量解密/扫描）：避免解压与复杂解析，显著提升速度。
+  /// 仅依赖常用字段：local_id/create_time/local_type/packed_info_data/is_send/sender_username。
+  factory Message.fromMapLite(Map<String, dynamic> map, {String? myWxid}) {
+    int intValue(List<String> keys, {int defaultValue = 0}) {
+      for (final key in keys) {
+        final v = map[key];
+        if (v == null) continue;
+        if (v is int) return v;
+        if (v is num) return v.toInt();
+        final parsed = int.tryParse(v.toString());
+        if (parsed != null) return parsed;
+      }
+      return defaultValue;
+    }
+
+    int? nullableIntValue(List<String> keys) {
+      for (final key in keys) {
+        final v = map[key];
+        if (v == null) continue;
+        if (v is int) return v;
+        if (v is num) return v.toInt();
+        final parsed = int.tryParse(v.toString());
+        if (parsed != null) return parsed;
+      }
+      return null;
+    }
+
+    String stringValue(List<String> keys) {
+      for (final key in keys) {
+        final v = map[key];
+        if (v == null) continue;
+        if (v is String) return v;
+        return v.toString();
+      }
+      return '';
+    }
+
+    final localType = intValue(['local_type', 'type', 'localType']);
+    final senderUsername = stringValue(['sender_username']);
+    final isSendVal = nullableIntValue(['computed_is_send', 'is_send', 'isSend']);
+
+    final packed = () {
+      final raw = map['packed_info_data'];
+      if (raw == null) return <int>[];
+      if (raw is Uint8List) return raw.cast<int>();
+      if (raw is List<int>) return raw;
+      if (raw is List) {
+        return raw.map((e) => int.tryParse(e.toString()) ?? 0).toList();
+      }
+      return <int>[];
+    }();
+
+    return Message(
+      localId: intValue(['local_id']),
+      serverId: intValue(['server_id']),
+      localType: localType,
+      sortSeq: intValue(['sort_seq']),
+      realSenderId: intValue(['real_sender_id']),
+      createTime: intValue(['create_time']),
+      status: intValue(['status']),
+      uploadStatus: intValue(['upload_status']),
+      downloadStatus: intValue(['download_status']),
+      serverSeq: intValue(['server_seq']),
+      originSource: intValue(['origin_source', 'WCDB_CT_source']),
+      source: stringValue(['source', 'WCDB_CT_source']),
+      messageContent: '',
+      compressContent: '',
+      packedInfoData: packed,
+      isSend: isSendVal,
+      senderUsername: senderUsername.isEmpty ? null : senderUsername,
+      imageMd5: null,
+      myWxid: myWxid,
+      patInfo: null,
+      voiceDurationSeconds: null,
+      parsedContent: '',
+    );
+  }
+
   /// 检查解析结果，防止XML泄露
   static String _checkParseResult(
     String result,
@@ -518,7 +596,8 @@ class Message {
   static String _stripSenderPrefix(String input) {
     if (input.isEmpty) return input;
     final prefixPattern = RegExp(
-      r'^[\s\u00A0\u2000-\u200B\u202F\u205F\u3000]*([a-zA-Z0-9_-]+):\s*',
+      // 仅匹配形如 "alice: hi" 的前缀，避免把 "https://xxx" 误删为 "//xxx"
+      r'^[\s\u00A0\u2000-\u200B\u202F\u205F\u3000]*([a-zA-Z0-9_-]+):(?!//)\s*',
     );
     return input.replaceFirst(prefixPattern, '');
   }

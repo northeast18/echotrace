@@ -127,6 +127,8 @@ flutter build windows
 
 - **[chatlog](https://github.com/sjzar/chatlog)**：感谢该项目为解密微信聊天记录提供了重要思路和参考
 - **[WxDatDecrypt](https://github.com/recarto404/WxDatDecrypt)**：感谢该项目为解密微信图片提供了解密方法参考
+- **[@sai595870682](https://github.com/sai595870682)**：感谢该用户提供了内联图片与语音解析的思路
+
 
 
 ##  写在最后

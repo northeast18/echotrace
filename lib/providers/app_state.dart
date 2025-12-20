@@ -1,5 +1,6 @@
 // 全局应用状态：初始化日志/配置/数据库，管理页面路由、解密进度、错误与头像缓存
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
@@ -7,6 +8,7 @@ import '../services/database_service.dart';
 import '../services/config_service.dart';
 import '../services/logger_service.dart';
 import '../services/voice_message_service.dart';
+import '../services/bulk_worker_pool.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -16,6 +18,50 @@ class AppState extends ChangeNotifier {
   final ConfigService configService = ConfigService();
   late final VoiceMessageService voiceService =
       VoiceMessageService(databaseService);
+
+  BulkJobHandle? _activeBulkJob;
+
+  bool get isBulkJobRunning => _activeBulkJob != null;
+  String? get bulkJobSession => _activeBulkJob?.sessionUsername;
+  String? get bulkJobType => _activeBulkJob?.typeLabel;
+  BulkWorkerPool? get bulkWorkerPool => _activeBulkJob?.pool;
+
+  BulkJobHandle? tryStartBulkJob({
+    required String sessionUsername,
+    required String typeLabel,
+    required int poolSize,
+  }) {
+    if (_activeBulkJob != null) return null;
+
+    final handle = BulkJobHandle._(
+      id: DateTime.now().microsecondsSinceEpoch,
+      sessionUsername: sessionUsername,
+      typeLabel: typeLabel,
+      poolSize: poolSize,
+    );
+    _activeBulkJob = handle;
+    notifyListeners();
+    handle._startPool().catchError((_) {
+      // 如果启动失败，释放锁，避免卡死在“进行中”状态。
+      if (_activeBulkJob?.id == handle.id) {
+        _activeBulkJob = null;
+        notifyListeners();
+      }
+    });
+    return handle;
+  }
+
+  Future<void> endBulkJob(BulkJobHandle handle) async {
+    if (_activeBulkJob?.id != handle.id) return;
+    final pool = _activeBulkJob?.pool;
+    _activeBulkJob = null;
+    notifyListeners();
+    try {
+      await handle.close();
+      // 兼容旧逻辑：若 pool 已在 handle.close() 前拿到，确保关闭
+      await pool?.close();
+    } catch (_) {}
+  }
 
   bool _isConfigured = false;
   String _currentPage = 'welcome';
@@ -622,5 +668,39 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       await logger.warning('AppState', '保存头像缓存失败', e);
     }
+  }
+}
+
+class BulkJobHandle {
+  BulkJobHandle._({
+    required this.id,
+    required this.sessionUsername,
+    required this.typeLabel,
+    required this.poolSize,
+  }) : _poolCompleter = Completer<BulkWorkerPool>();
+
+  final int id;
+  final String sessionUsername;
+  final String typeLabel;
+  final int poolSize;
+
+  final Completer<BulkWorkerPool> _poolCompleter;
+  Future<BulkWorkerPool> get poolFuture => _poolCompleter.future;
+  BulkWorkerPool? _pool;
+  BulkWorkerPool? get pool => _pool;
+
+  Future<void> _startPool() async {
+    final pool = await BulkWorkerPool.start(size: poolSize);
+    _pool = pool;
+    if (!_poolCompleter.isCompleted) {
+      _poolCompleter.complete(pool);
+    }
+  }
+
+  Future<void> close() async {
+    try {
+      final pool = _pool ?? (await _poolCompleter.future);
+      await pool.close();
+    } catch (_) {}
   }
 }

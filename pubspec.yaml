@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.2.0+1
+version: 2.2.1+1
 
 environment:
   sdk: ^3.9.2
@@ -92,7 +92,15 @@ dependencies:
 
   msix: ^3.16.8
   audioplayers: ^5.2.1
+  flutter_lame:
+    path: third_party/flutter_lame
+  dart_lame:
+    path: third_party/dart_lame
 
+dependency_overrides:
+  dart_lame:
+    path: third_party/dart_lame
+ 
 msix_config:
   display_name: EchoTrace
   publisher_display_name: EchoTrace
@@ -124,7 +132,6 @@ flutter:
   assets:
     - assets/HarmonyOS_SansSC/
     - assets/dll/
-    - assets/ffmpeg.exe
     - assets/silk_v3_decoder.exe
 
   # An image asset can refer to one or more resolution-specific "variants", see
