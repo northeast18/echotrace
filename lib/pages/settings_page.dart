@@ -87,8 +87,6 @@ class _SettingsPageState extends State<SettingsPage>
     final imageXorKey = await _configService.getImageXorKey();
     final imageAesKey = await _configService.getImageAesKey();
     final manualWxid = await _configService.getManualWxid();
-    final normalizedWxid =
-        manualWxid != null ? _normalizeWxid(manualWxid) : null;
     final debugMode = await _configService.getDebugMode();
 
     if (mounted) {
@@ -101,10 +99,10 @@ class _SettingsPageState extends State<SettingsPage>
         _initialMode = mode;
         _imageXorKeyController.text = imageXorKey ?? '';
         _imageAesKeyController.text = imageAesKey ?? '';
-        _wxidController.text = normalizedWxid ?? '';
+        _wxidController.text = manualWxid ?? '';
         _initialImageXorKey = imageXorKey ?? '';
         _initialImageAesKey = imageAesKey ?? '';
-        _initialWxid = normalizedWxid ?? '';
+        _initialWxid = manualWxid ?? '';
         _debugMode = debugMode;
         _showWxidInput = true; // 始终显示 wxid 输入框
       });
@@ -189,20 +187,15 @@ class _SettingsPageState extends State<SettingsPage>
     final trimmed = value.trim();
     if (trimmed.isEmpty) return null;
 
-    // 若末尾是 _xxxx（常见的目录后缀），先去掉再做规范化
-    final hasTrailingCode =
-        trimmed.length >= 5 && RegExp(r'_[0-9A-Za-z]{4}$').hasMatch(trimmed);
-    final base = hasTrailingCode
-        ? trimmed.substring(0, trimmed.length - 5)
-        : trimmed;
-    if (base.isEmpty) return null;
+    // 非 wxid_ 开头的账号：清理末尾 "_xxxx"(下划线 + 4 位字母/数字) 再统一小写用于比较
+    final cleaned = trimmed.replaceFirst(RegExp(r'_[a-zA-Z0-9]{4}$'), '');
 
-    final lower = base.toLowerCase();
+    final lower = cleaned.toLowerCase();
     if (!lower.startsWith('wxid_')) return lower;
 
     // wxid_x_xxx -> wxid_x
     final match =
-        RegExp(r'^(wxid_[^_]+)', caseSensitive: false).firstMatch(base);
+        RegExp(r'^(wxid_[^_]+)', caseSensitive: false).firstMatch(cleaned);
     if (match != null) return match.group(1)!.toLowerCase();
     return lower;
   }
@@ -497,8 +490,7 @@ class _SettingsPageState extends State<SettingsPage>
     try {
       final key = _keyController.text.trim();
       final path = _pathController.text.trim();
-      final wxidNormalized = _normalizeWxid(_wxidController.text) ?? '';
-      _wxidController.text = wxidNormalized;
+      final wxid = _wxidController.text.trim();
       var imageXorKey = _imageXorKeyController.text.trim();
       final imageAesKey = _imageAesKeyController.text.trim();
 
@@ -513,8 +505,8 @@ class _SettingsPageState extends State<SettingsPage>
       await _configService.saveDatabaseMode(_databaseMode);
 
       // 保存手动输入的wxid（如果有）
-      if (wxidNormalized.isNotEmpty) {
-        await _configService.saveManualWxid(wxidNormalized);
+      if (wxid.isNotEmpty) {
+        await _configService.saveManualWxid(wxid);
       }
 
       // 保存图片解密密钥（可选）
@@ -561,7 +553,7 @@ class _SettingsPageState extends State<SettingsPage>
       _initialKey = key;
       _initialPath = path;
       _initialMode = _databaseMode;
-      _initialWxid = wxidNormalized;
+      _initialWxid = wxid;
       _initialImageXorKey = imageXorKey;
       _initialImageAesKey = imageAesKey;
       _lastWxidPathChecked = path;

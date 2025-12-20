@@ -2773,8 +2773,12 @@ class DatabaseService {
     final trimmed = wxid.trim();
     if (trimmed.isEmpty) return null;
 
-    // 非 wxid 开头的自定义账号直接返回原始字符串
-    if (!trimmed.toLowerCase().startsWith('wxid_')) return trimmed;
+    // 非 wxid 开头的自定义账号：若末尾是 "_xxxx"(下划线 + 4 位字母/数字) 则去掉该后缀
+    if (!trimmed.toLowerCase().startsWith('wxid_')) {
+      final suffixMatch = RegExp(r'^(.+)_([a-zA-Z0-9]{4})$').firstMatch(trimmed);
+      if (suffixMatch != null) return suffixMatch.group(1);
+      return trimmed;
+    }
 
     final match =
         RegExp(r'^(wxid_[^_]+)', caseSensitive: false).firstMatch(trimmed);
