@@ -22,9 +22,39 @@ jobs:
         with:
           channel: stable
 
+      - name: Configure git/curl TLS backend
+        shell: pwsh
+        run: |
+          git config --global http.sslBackend openssl
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\Pub\Cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
       - run: flutter clean
       - run: flutter pub get
-      - run: flutter build windows --release
+
+      - name: Build Windows (retry)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference="Stop"
+          for ($i=1; $i -le 3; $i++) {
+            try {
+              flutter build windows --release
+              break
+            } catch {
+              if ($i -eq 3) { throw }
+              Write-Host "Build failed, retrying... ($i/3)"
+              Start-Sleep -Seconds 15
+            }
+          }
 
       - name: Build zip
         shell: pwsh
@@ -55,7 +85,6 @@ jobs:
 
           "MSIX_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          
       - name: Build release body
         uses: actions/github-script@v7
         with:
